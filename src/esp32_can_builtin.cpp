@@ -166,7 +166,21 @@ void ESP32CAN::CAN_WatchDog_Builtin(void *pvParameters) {
 #endif
         if (result == ESP_OK)
         {
-            if (status_info.state == TWAI_STATE_BUS_OFF)
+            if (status_info.state == TWAI_STATE_STOPPED && espCan->busRecoveryPending)
+            {
+                // recovery leaves the driver stopped; it has to be started again to rejoin the bus
+                espCan->busRecoveryPending = false;
+#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 2, 0)
+                result = twai_start_v2(espCan->bus_handle);
+#else
+                result = twai_start();
+#endif
+                if (result != ESP_OK)
+                {
+                    ESP_LOGE(espCan->TAG, "Could not restart after bus recovery, result = %d!", result);
+                }
+            }
+            else if (status_info.state == TWAI_STATE_BUS_OFF)
             {
                 espCan->cyclesSinceTraffic = 0;
                 if (espCan->forceRecoveryEnabled && !espCan->forcedRecoveryInProgress)
@@ -183,7 +197,11 @@ void ESP32CAN::CAN_WatchDog_Builtin(void *pvParameters) {
 #else
                     result = twai_initiate_recovery();
 #endif
-                    if (result != ESP_OK)
+                    if (result == ESP_OK)
+                    {
+                        espCan->busRecoveryPending = true;
+                    }
+                    else
                     {
                         ESP_LOGE(espCan->TAG, "Could not initiate bus recovery, result = %d!", result);
                     }
@@ -263,15 +281,16 @@ void ESP32CAN::sendCallback(CAN_FRAME *frame)
     if (frame->fid & 0x80000000ul) // object callback
     {
         idx = (frame->fid >> 24) & 0x7F;
-        thisListener = listener[idx];
-        thisListener->gotFrame(frame, mb);
+        thisListener = (idx < SIZE_LISTENERS) ? listener[idx] : NULL;
+        if (thisListener)
+            thisListener->gotFrame(frame, mb);
     }
     else // C function callback
     {
-        if (mb > -1)
-            (*cbCANFrame[mb])(frame);
-        else
-            (*cbGeneral)(frame);
+        // the callback may have been removed after this frame was queued
+        void (*cb)(CAN_FRAME *) = (mb > -1) ? cbCANFrame[mb] : cbGeneral;
+        if (cb)
+            (*cb)(frame);
     }
 }
 
@@ -327,16 +346,16 @@ void ESP32CAN::_init()
     }
 
     ESP_LOGI(TAG, "Creating queues");
-    callbackQueue = xQueueCreate(16, sizeof(CAN_FRAME));
-    rx_queue = xQueueCreate(rxBufferSize, sizeof(CAN_FRAME));
+    // created once: the tasks hold on to these, and a second begin() used to leak the first pair
+    if (!callbackQueue)
+        callbackQueue = xQueueCreate(16, sizeof(CAN_FRAME));
+    if (!rx_queue)
+        rx_queue = xQueueCreate(rxBufferSize, sizeof(CAN_FRAME));
 
     if (!CAN_WatchDog_Builtin_handler) {
+        char canWatchDogTaskName[16] = "CAN_WD_BI";
 #if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 2, 0)
-        std::ostringstream canWatchDogTaskNameStream;
-        canWatchDogTaskNameStream << "CAN_WD_BI_CAN" << twai_general_cfg.controller_id;
-        const char *canWatchDogTaskName = canWatchDogTaskNameStream.str().c_str();
-#else
-        const char *canWatchDogTaskName = "CAN_WD_BI";
+        snprintf(canWatchDogTaskName, sizeof(canWatchDogTaskName), "CAN_WD_BI_CAN%d", (int)twai_general_cfg.controller_id);
 #endif
 
 #if defined(CONFIG_FREERTOS_UNICORE)
@@ -354,7 +373,12 @@ uint32_t ESP32CAN::init(uint32_t ul_baudrate)
     ESP_LOGD(TAG, "Init called");
     _init();
     ESP_LOGD(TAG, "Init done");
-    set_baudrate(ul_baudrate);
+    // enable() only sets readyForTraffic once the driver is installed and started
+    if (!callbackQueue || !rx_queue || set_baudrate(ul_baudrate) == 0 || !readyForTraffic)
+    {
+        ESP_LOGE(TAG, "Init failed");
+        return 0;
+    }
     ESP_LOGD(TAG, "Baudrate set");
     if (debuggingMode)
     {
@@ -377,8 +401,6 @@ uint32_t ESP32CAN::init(uint32_t ul_baudrate)
         }
     }
 
-    ESP_LOGD(TAG, "init(): readyForTraffic = true");
-    readyForTraffic = true;
     return ul_baudrate;
 }
 
@@ -463,6 +485,8 @@ void ESP32CAN::setNoACKMode(bool state)
 
 void ESP32CAN::enable()
 {
+    readyForTraffic = false;
+    busRecoveryPending = false;
 #if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 2, 0)
     auto result = twai_driver_install_v2(&twai_general_cfg, &twai_speed_cfg, &twai_filters_cfg, &bus_handle);
     if (result == ESP_OK) {
@@ -483,16 +507,11 @@ void ESP32CAN::enable()
     }
 #endif
 
+    char canHandlerTaskName[16] = "CAN_RX_CAN";
+    char canLowLevelTaskName[16] = "CAN_LORX_CAN";
 #if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 2, 0)
-    std::ostringstream canHandlerTaskNameStream;
-    std::ostringstream canLowLevelTaskNameStream;
-    canHandlerTaskNameStream << "CAN_RX_CAN" << twai_general_cfg.controller_id;
-    canLowLevelTaskNameStream << "CAN_LORX_CAN" << twai_general_cfg.controller_id;
-    const char *canHandlerTaskName = canHandlerTaskNameStream.str().c_str();
-    const char *canLowLevelTaskName = canLowLevelTaskNameStream.str().c_str();
-#else
-    const char *canHandlerTaskName = "CAN_RX_CAN";
-    const char *canLowLevelTaskName = "CAN_LORX_CAN";
+    snprintf(canHandlerTaskName, sizeof(canHandlerTaskName), "CAN_RX_CAN%d", (int)twai_general_cfg.controller_id);
+    snprintf(canLowLevelTaskName, sizeof(canLowLevelTaskName), "CAN_LORX_CAN%d", (int)twai_general_cfg.controller_id);
 #endif
 
     ESP_LOGI(TAG, "Starting can handler task %s", canHandlerTaskName);
@@ -512,7 +531,7 @@ void ESP32CAN::enable()
     if (result == ESP_OK) {
         ESP_LOGI(TAG, "TWAI Driver %d started", twai_general_cfg.controller_id);
     } else {
-        ESP_LOGE(TAG, "Failed to start TWAI driver %d: error: 0x%", twai_general_cfg.controller_id, result);
+        ESP_LOGE(TAG, "Failed to start TWAI driver %d: error: 0x%x", twai_general_cfg.controller_id, result);
         return;
     }
 #else
@@ -549,13 +568,15 @@ void ESP32CAN::disable()
 #endif            
         }
 
-        for (auto task : {task_CAN_handler, task_LowLevelRX_handler})
+        if (task_CAN_handler != NULL)
         {
-            if (task != NULL)
-            {
-                vTaskDelete(task);
-                task = NULL;
-            }
+            vTaskDelete(task_CAN_handler);
+            task_CAN_handler = NULL;
+        }
+        if (task_LowLevelRX_handler != NULL)
+        {
+            vTaskDelete(task_LowLevelRX_handler);
+            task_LowLevelRX_handler = NULL;
         }
 
 #if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 2, 0)
@@ -580,7 +601,7 @@ bool ESP32CAN::processFrame(twai_message_t &frame)
     cyclesSinceTraffic = 0; // reset counter to show that we are receiving traffic
 
     msg.id = frame.identifier;
-    msg.length = frame.data_length_code;
+    msg.length = frame.data_length_code > 8 ? 8 : frame.data_length_code;
     msg.rtr = frame.rtr;
     msg.extended = frame.extd;
     for (int i = 0; i < 8; i++)
@@ -618,7 +639,7 @@ bool ESP32CAN::processFrame(twai_message_t &frame)
                             xQueueSend(callbackQueue, &msg, 0);
                             return true;
                         }
-                        else if (thisListener->isCallbackActive(numFilters)) // global catch-all
+                        else if (thisListener->isCallbackActive(-1)) // global catch-all
                         {
                             msg.fid = 0x80000000ul + (listenerPos << 24ul) + 0xFF;
                             xQueueSend(callbackQueue, &msg, 0);
@@ -640,7 +661,7 @@ bool ESP32CAN::processFrame(twai_message_t &frame)
 
 bool ESP32CAN::sendFrame(CAN_FRAME &txFrame)
 {
-    twai_message_t __TX_frame;
+    twai_message_t __TX_frame = {};
 
     __TX_frame.identifier = txFrame.id;
     __TX_frame.data_length_code = txFrame.length;
@@ -662,23 +683,22 @@ bool ESP32CAN::sendFrame(CAN_FRAME &txFrame)
     switch (result)
     {
     case ESP_OK:
+        txFault = false;
         if (debuggingMode)
             Serial.write('<');
         break;
-    case ESP_ERR_TIMEOUT:
+    case ESP_ERR_TIMEOUT: // TX queue full: busy, not a fault
         if (debuggingMode)
             Serial.write('T');
         break;
-    case ESP_ERR_INVALID_ARG:
-    case ESP_FAIL:
-    case ESP_ERR_INVALID_STATE:
-    case ESP_ERR_NOT_SUPPORTED:
+    default: // driver not running (bus-off, stopped, not installed) or a bad frame
+        txFault = true;
         if (debuggingMode)
             Serial.write('!');
         break;
     }
 
-    return true;
+    return result == ESP_OK;
 }
 
 bool ESP32CAN::rx_avail()

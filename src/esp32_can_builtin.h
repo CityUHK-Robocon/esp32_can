@@ -104,14 +104,15 @@ public:
 
 protected:
   bool readyForTraffic;
+  bool busRecoveryPending = false; //bus-off recovery was started and the driver still needs a restart
   int cyclesSinceTraffic;
                                                                       //tx,         rx,           mode
   twai_general_config_t twai_general_cfg = TWAI_GENERAL_CONFIG_DEFAULT(GPIO_NUM_17, GPIO_NUM_16, TWAI_MODE_NORMAL);
   twai_timing_config_t twai_speed_cfg = TWAI_TIMING_CONFIG_500KBITS();
   twai_filter_config_t twai_filters_cfg = TWAI_FILTER_CONFIG_ACCEPT_ALL();
 
-  QueueHandle_t callbackQueue;
-  QueueHandle_t rx_queue;
+  QueueHandle_t callbackQueue = NULL;
+  QueueHandle_t rx_queue = NULL;
 
   TaskHandle_t CAN_WatchDog_Builtin_handler = NULL;
   TaskHandle_t task_CAN_handler = NULL;
